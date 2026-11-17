@@ -18,7 +18,7 @@ import (
 var missing = []byte("{\"message\":\"Not Found\"}")
 var healthy = httpReply{status: 200, typ: contentType, body: []byte("{\"ok\":true}")}
 
-func (s *store) httpResponse(method, path, origin, rawQuery, service, protocol, credential, encoding string, body []byte) (reply httpReply) {
+func (s *store) httpResponse(method, path, host, rawQuery, service, protocol, credential, encoding string, body []byte) (reply httpReply) {
 	defer func() {
 		if cause := recover(); cause != nil {
 			if e, ok := cause.(apiError); ok {
@@ -47,8 +47,14 @@ func (s *store) httpResponse(method, path, origin, rawQuery, service, protocol, 
 	if !s.authorized(credential, false) {
 		reject(401, "Bad credentials")
 	}
+	if isRest && method == "GET" {
+		if data := s.readCachedIssue(path); data != nil {
+			return httpReply{status: 200, typ: contentType, body: data}
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	origin := "http://" + host
 	if isRest {
 		return s.rest(method, path, origin, rawQuery, body)
 	}
@@ -69,9 +75,8 @@ func (s *store) handler(ctx *fasthttp.RequestCtx) {
 			service = string(ctx.QueryArgs().Peek("service"))
 		}
 	}
-	origin := "http://" + string(ctx.Host())
 	headers := &ctx.Request.Header
-	reply := s.httpResponse(string(ctx.Method()), path, origin, query, service, string(headers.Peek("Git-Protocol")),
+	reply := s.httpResponse(string(ctx.Method()), path, string(ctx.Host()), query, service, string(headers.Peek("Git-Protocol")),
 		string(headers.Peek("Authorization")), string(headers.Peek("Content-Encoding")), ctx.PostBody())
 	if path != "/mcp" && path != "/api/graphql" {
 		ctx.Response.Header.Set("X-GitHub-Request-Id", strconv.FormatUint(s.sequence.Add(1), 16))
@@ -169,7 +174,11 @@ func run() error {
 		return err
 	}
 	defer listener.Close()
-	server := &fasthttp.Server{Handler: s.handler, MaxRequestBodySize: maxBody, ReadTimeout: 30 * time.Second, IdleTimeout: 20 * time.Second, NoDefaultServerHeader: true}
+	server := &fasthttp.Server{
+		Handler: s.handler, MaxRequestBodySize: maxBody,
+		ReadTimeout: 30 * time.Second, IdleTimeout: 20 * time.Second,
+		NoDefaultServerHeader: true, DisablePreParseMultipartForm: true, LazyRequestTime: true,
+	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	fmt.Println(port)
 	if env == "" {

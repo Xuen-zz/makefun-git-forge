@@ -190,16 +190,17 @@ func (r *gitRepository) receive(body []byte) ([]byte, error) {
 		if len(commands) == 0 {
 			capabilities = strings.Fields(caps)
 		}
-		fields := strings.Split(command, " ")
-		if len(fields) != 3 || !strings.HasPrefix(fields[2], "refs/") || len(fields[2]) > 4096 || plumbing.ReferenceName(fields[2]).Validate() != nil {
+		oldHex, rest, _ := strings.Cut(command, " ")
+		nextHex, ref, _ := strings.Cut(rest, " ")
+		if !strings.HasPrefix(ref, "refs/") || len(ref) > 4096 || plumbing.ReferenceName(ref).Validate() != nil {
 			return nil, invalidPackets
 		}
-		old, okOld := parseHash(fields[0])
-		next, okNext := parseHash(fields[1])
+		old, okOld := parseHash(oldHex)
+		next, okNext := parseHash(nextHex)
 		if !okOld || !okNext {
 			return nil, invalidPackets
 		}
-		commands = append(commands, refUpdate{old, next, fields[2]})
+		commands = append(commands, refUpdate{old, next, ref})
 	}
 	staged, unpackErr := r.decodePack(data)
 	report := slices.Contains(capabilities, "report-status")
@@ -408,13 +409,20 @@ func (r *gitRepository) fetch(spec shallowSpec, v2, v0Have, sideband bool) ([]by
 	return append(out, packed.Bytes()...), nil
 }
 
+func (r *gitRepository) cachedUpload(body []byte) []byte {
+	if cached := r.refsReply.Load(); cached != nil && bytes.Equal(body, cached.request) {
+		return cached.response
+	}
+	if cached := r.fetchReply.Load(); cached != nil && bytes.Equal(body, cached.request) {
+		return cached.response
+	}
+	return nil
+}
+
 func (r *gitRepository) upload(body []byte, v2 bool) ([]byte, error) {
 	if v2 {
-		if r.refsReply.response != nil && bytes.Equal(body, r.refsReply.request) {
-			return r.refsReply.response, nil
-		}
-		if r.fetchReply.response != nil && bytes.Equal(body, r.fetchReply.request) {
-			return r.fetchReply.response, nil
+		if cached := r.cachedUpload(body); cached != nil {
+			return cached, nil
 		}
 	}
 	lines, tail, flushed, err := packets(body)
@@ -430,7 +438,7 @@ func (r *gitRepository) upload(body []byte, v2 bool) ([]byte, error) {
 		if lines[0] == "command=ls-refs" {
 			out := r.lsRefs(lines)
 			if len(body) <= 16384 && len(out) <= 262144 {
-				r.refsReply = wireCache{bytes.Clone(body), out}
+				r.refsReply.Store(&wireCache{bytes.Clone(body), out})
 			}
 			return out, nil
 		}
@@ -458,7 +466,7 @@ func (r *gitRepository) upload(body []byte, v2 bool) ([]byte, error) {
 	spec.relative = spec.relative || slices.Contains(caps, "deepen-relative")
 	out, err := r.fetch(spec, v2, haveTail, slices.Contains(caps, "side-band-64k"))
 	if err == nil && v2 && spec.done && spec.depth == 1 && len(spec.haves) == 0 && len(spec.shallow) == 0 && len(body) <= 16384 && len(out) <= 1<<20 {
-		r.fetchReply = wireCache{bytes.Clone(body), out}
+		r.fetchReply.Store(&wireCache{bytes.Clone(body), out})
 	}
 	return out, err
 }
@@ -504,9 +512,9 @@ func (s *store) gitHTTP(method, login, name, route, service, protocol, credentia
 	if !strings.EqualFold(login, s.user.Login) {
 		return notFound
 	}
-	s.mu.Lock()
+	s.mu.RLock()
 	repo := s.repos[strings.ToLower(name)]
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	if repo == nil {
 		return notFound
 	}
@@ -538,9 +546,18 @@ func (s *store) gitHTTP(method, login, name, route, service, protocol, credentia
 		body = data
 	}
 	r := repo.git
+	typ := "application/x-" + service
+	if service == uploadService && v2 {
+		if advertise {
+			return httpReply{status: 200, typ: typ + "-advertisement", body: advertiseV2}
+		}
+		// Published replies and their request keys are immutable. Ref updates drop both entries.
+		if cached := r.cachedUpload(body); cached != nil {
+			return httpReply{status: 200, typ: typ + "-result", body: cached}
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	typ := "application/x-" + service
 	if advertise {
 		return httpReply{status: 200, typ: typ + "-advertisement", body: r.advertise(service, v2)}
 	}

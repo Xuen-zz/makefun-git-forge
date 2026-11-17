@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
@@ -36,8 +37,8 @@ type gitRepository struct {
 	objects map[plumbing.Hash]objectLinks
 
 	receiveAdvertisement []byte
-	refsReply            wireCache
-	fetchReply           wireCache
+	refsReply            atomic.Pointer[wireCache]
+	fetchReply           atomic.Pointer[wireCache]
 }
 
 type objectLinks struct {
@@ -55,8 +56,8 @@ func newGitRepository() *gitRepository {
 
 func (r *gitRepository) invalidateAdvertisements() {
 	r.receiveAdvertisement = nil
-	r.refsReply = wireCache{}
-	r.fetchReply = wireCache{}
+	r.refsReply.Store(nil)
+	r.fetchReply.Store(nil)
 }
 
 func (r *gitRepository) refNames() []string {
@@ -82,14 +83,19 @@ func readLinks(obj plumbing.EncodedObject) (objectLinks, error) {
 	if links.kind == plumbing.BlobObject {
 		return links, nil
 	}
-	reader, err := obj.Reader()
-	if err != nil {
-		return links, err
-	}
-	defer reader.Close()
-	data, err := io.ReadAll(io.LimitReader(reader, maxObject+1))
-	if err != nil || len(data) > maxObject {
-		return links, badGraph
+	var data []byte
+	if direct, ok := obj.(*fullObject); ok {
+		data = direct.data
+	} else {
+		reader, err := obj.Reader()
+		if err != nil {
+			return links, err
+		}
+		defer reader.Close()
+		data, err = io.ReadAll(io.LimitReader(reader, maxObject+1))
+		if err != nil || len(data) > maxObject {
+			return links, badGraph
+		}
 	}
 	switch links.kind {
 	case plumbing.CommitObject, plumbing.TagObject:
@@ -175,6 +181,13 @@ func (r *gitRepository) decodePack(data []byte) (*stagedPack, error) {
 	if (version != 2 && version != 3) || count > 100_000 || int64(count) > int64(end-12)/3 || !bytes.Equal(digest[:], data[end:]) {
 		return nil, badPack
 	}
+	if err := staged.decodeFullObjects(data[12:end], count); err != needsDeltaResolution {
+		if err != nil {
+			return nil, err
+		}
+		return staged, nil
+	}
+	staged = &stagedPack{Storage: memory.NewStorage(), existing: r.db}
 	scan := packfile.NewScanner(bytes.NewReader(data))
 	defer scan.Close()
 	parser, err := packfile.NewParserWithStorage(scan, staged)

@@ -85,7 +85,7 @@ type repository struct {
 	git                                        *gitRepository
 }
 type store struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	repos    map[string]*repository
 	nodes    map[string]any
 	sequence atomic.Uint64

@@ -265,6 +265,29 @@ func (s *store) restGit(r *repository, method, section, tail, requestPath, origi
 	reject(404, "Not Found")
 	return httpReply{}
 }
+func (s *store) readCachedIssue(path string) []byte {
+	repoPath, ok := strings.CutPrefix(path, "/api/v3/repos/")
+	if !ok {
+		return nil
+	}
+	owner, tail, _ := strings.Cut(repoPath, "/")
+	name, tail, _ := strings.Cut(tail, "/")
+	item, ok := strings.CutPrefix(tail, "issues/")
+	if !ok {
+		return nil
+	}
+	n, err := strconv.Atoi(item)
+	if err != nil || n <= 0 {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if r := s.find(owner, name); r != nil {
+		return r.issueJSON[n]
+	}
+	return nil
+}
+
 func (s *store) restIssues(r *repository, method, tail, requestPath, origin string, q url.Values, input mapJSON) httpReply {
 	if tail == "" {
 		if method == "POST" {
