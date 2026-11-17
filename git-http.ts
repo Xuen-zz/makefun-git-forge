@@ -10,19 +10,28 @@ const ADVERTISE_V2 = Buffer.concat([
 const AGENT = 'agent=makefun-forge/1.0';
 const RECEIVE_CAPS = `report-status delete-refs side-band-64k ofs-delta object-format=sha1 ${AGENT}`;
 const UPLOAD_CAPS = `shallow deepen-relative side-band-64k ofs-delta include-tag object-format=sha1 ${AGENT}`;
-const RECEIVE_PREAMBLE = packet('# service=git-receive-pack\n');
 const UPLOAD_PREAMBLE = packet('# service=git-upload-pack\n');
 const UNPACK_OK = packet('unpack ok\n');
 const UNPACK_INVALID = packet('unpack invalid pack\n');
 const pushSuccess = new WeakMap<GitStore, { ref: string; plain: Buffer; banded: Buffer }>();
+const packetHex = new Int8Array(256).fill(-1);
+for (let digit = 0; digit < 16; digit++) {
+  const code = digit.toString(16).charCodeAt(0);
+  packetHex[code] = digit;
+  if (digit >= 10) packetHex[code - 32] = digit;
+}
 
 type Target = { git: GitStore; defaultBranch: string };
 type Packets = { lines: string[]; offset: number; ended: boolean };
 
-function packet(line: string): Buffer {
+function packetText(line: string): string {
   const bytes = Buffer.byteLength(line);
   if (bytes > 65516) throw new Error('Packet exceeds line limit');
-  return Buffer.from(`${(bytes + 4).toString(16).padStart(4, '0')}${line}`);
+  return `${(bytes + 4).toString(16).padStart(4, '0')}${line}`;
+}
+
+function packet(line: string): Buffer {
+  return Buffer.from(packetText(line));
 }
 
 function sideband(body: Buffer): Buffer[] {
@@ -37,26 +46,30 @@ function sideband(body: Buffer): Buffer[] {
 function readPackets(body: Buffer, offset = 0): Packets {
   const lines: string[] = [];
   while (offset < body.length) {
-    const header = body.toString('ascii', offset, offset + 4);
-    if (!/^[0-9a-fA-F]{4}$/.test(header)) throw new Error('Invalid packet length');
-    const size = parseInt(header, 16);
+    if (offset + 4 > body.length) throw new Error('Invalid packet length');
+    const a = packetHex[body[offset]], b = packetHex[body[offset + 1]];
+    const c = packetHex[body[offset + 2]], d = packetHex[body[offset + 3]];
+    if ((a | b | c | d) < 0) throw new Error('Invalid packet length');
+    const size = (a << 12) | (b << 8) | (c << 4) | d;
     if (!size) return { lines, offset: offset + 4, ended: true };
     if (size === 1) { offset += 4; continue; }
     if (size < 4 || size > 65520 || offset + size > body.length) throw new Error('Invalid packet size');
-    lines.push(body.toString('utf8', offset + 4, offset + size).replace(/\n$/, ''));
-    offset += size;
+    const end = offset + size;
+    const textEnd = size > 4 && body[end - 1] === 10 ? end - 1 : end;
+    lines.push(body.toString('utf8', offset + 4, textEnd));
+    offset = end;
   }
   return { lines, offset, ended: false };
 }
 
 type Ref = { oid: string; name: string; symref?: string; peeled?: string };
-function listRefs({ git, defaultBranch }: Target, receive: boolean): Ref[] {
+function listRefs({ git, defaultBranch }: Target): Ref[] {
   const head = branchRef(defaultBranch);
   const refs: Ref[] = [];
   const tip = git.refs.get(head);
-  if (!receive && tip) refs.push({ oid: tip, name: 'HEAD', symref: head });
+  if (tip) refs.push({ oid: tip, name: 'HEAD', symref: head });
   for (const [name, oid] of git.refs) {
-    const peeled = receive ? oid : git.peel(oid);
+    const peeled = git.peel(oid);
     refs.push({ oid, name, peeled: peeled !== oid ? peeled : undefined });
   }
   return refs;
@@ -64,9 +77,10 @@ function listRefs({ git, defaultBranch }: Target, receive: boolean): Ref[] {
 
 export function advertise(target: Target, receive: boolean, v2: boolean): Buffer {
   if (!receive && v2) return ADVERTISE_V2;
-  const caps = receive ? RECEIVE_CAPS : `${UPLOAD_CAPS} symref=HEAD:${branchRef(target.defaultBranch)}`;
-  const refs = listRefs(target, receive);
-  const parts = [receive ? RECEIVE_PREAMBLE : UPLOAD_PREAMBLE, FLUSH];
+  if (receive) return advertiseReceive(target.git);
+  const caps = `${UPLOAD_CAPS} symref=HEAD:${branchRef(target.defaultBranch)}`;
+  const refs = listRefs(target);
+  const parts = [UPLOAD_PREAMBLE, FLUSH];
   if (!refs.length) parts.push(packet(`${ZERO} capabilities^{}\0${caps}\n`));
   for (const [i, { oid, name, peeled }] of refs.entries()) {
     parts.push(packet(`${oid} ${name}${i === 0 ? `\0${caps}` : ''}\n`));
@@ -74,6 +88,25 @@ export function advertise(target: Target, receive: boolean, v2: boolean): Buffer
   }
   parts.push(FLUSH);
   return Buffer.concat(parts);
+}
+
+const RECEIVE_START = packetText('# service=git-receive-pack\n') + '0000';
+const EMPTY_RECEIVE = Buffer.from(RECEIVE_START + packetText(`${ZERO} capabilities^{}\0${RECEIVE_CAPS}\n`) + '0000');
+const receiveAdvertisements = new WeakMap<GitStore, { version: number; response: Buffer }>();
+
+function advertiseReceive(git: GitStore): Buffer {
+  if (git.refs.size === 0) return EMPTY_RECEIVE;
+  const cached = receiveAdvertisements.get(git);
+  if (cached?.version === git.refVersion) return cached.response;
+  let text = RECEIVE_START;
+  let capabilities = `\0${RECEIVE_CAPS}`;
+  for (const [ref, oid] of git.refs) {
+    text += packetText(`${oid} ${ref}${capabilities}\n`);
+    capabilities = '';
+  }
+  const response = Buffer.from(text + '0000');
+  if (response.length <= 262_144) receiveAdvertisements.set(git, { version: git.refVersion, response });
+  return response;
 }
 
 function lsRefs(target: Target, lines: string[]): Buffer {
@@ -86,7 +119,7 @@ function lsRefs(target: Target, lines: string[]): Buffer {
   if (!target.git.refs.has(head) && lines.includes('unborn') && matches('HEAD')) {
     parts.push(packet(`unborn HEAD symref-target:${head}\n`));
   }
-  for (const ref of listRefs(target, false)) {
+  for (const ref of listRefs(target)) {
     if (!matches(ref.name)) continue;
     const sym = symrefs && ref.symref ? ` symref-target:${ref.symref}` : '';
     const peeled = peel && ref.peeled ? ` peeled:${ref.peeled}` : '';

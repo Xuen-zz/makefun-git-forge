@@ -13,7 +13,17 @@ export const ZERO = '0'.repeat(40);
 export const isOid = (s: unknown): s is string => typeof s === 'string' && /^[0-9a-f]{40}$/.test(s);
 export const branchRef = (branch: string) => `refs/heads/${branch}`;
 export const sha1 = (data: Buffer) => hash('sha1', data, 'buffer');
-const objectId = (kind: Kind, data: Buffer) => createHash('sha1').update(`${kind} ${data.length}\0`).update(data).digest('hex');
+const SMALL_OBJECT_SIZE = 2048;
+const objectHashScratch = Buffer.allocUnsafe(SMALL_OBJECT_SIZE + 32);
+
+function objectId(kind: Kind, data: Buffer): string {
+  const header = `${kind} ${data.length}\0`;
+  if (data.length > SMALL_OBJECT_SIZE) return createHash('sha1').update(header).update(data).digest('hex');
+  // Both the scratch copy and one-shot digest finish before the next object is processed.
+  const offset = objectHashScratch.write(header, 'ascii');
+  data.copy(objectHashScratch, offset);
+  return hash('sha1', objectHashScratch.subarray(0, offset + data.length), 'hex');
+}
 const isTreeMode = (mode: string) => mode === '40000' || mode === '040000';
 
 export function validRef(ref: unknown): ref is string {
@@ -66,7 +76,9 @@ export function tagTarget(object?: ObjectData): string | undefined {
   return object.target = target.slice(7);
 }
 
-export function references(object: ObjectData, includeParents = true): string[] {
+const NO_REFERENCES: readonly string[] = [];
+
+export function references(object: ObjectData, includeParents = true): readonly string[] {
   switch (object.kind) {
     case 'commit': {
       const commit = asCommit(object)!;
@@ -74,7 +86,7 @@ export function references(object: ObjectData, includeParents = true): string[] 
     }
     case 'tree': return asTree(object).filter(entry => entry.mode !== '160000').map(entry => entry.oid);
     case 'tag': return [tagTarget(object)!];
-    case 'blob': return [];
+    case 'blob': return NO_REFERENCES;
   }
 }
 
@@ -241,9 +253,13 @@ export function readPack(pack: Buffer, existing: Objects): Objects {
     if (pos >= end) throw new Error('Truncated pack');
     return pack[pos++];
   };
-  const add = (offset: number, kind: Kind, data: Buffer, packed?: Buffer) => {
+  const add = (offset: number, kind: Kind, data: Buffer, packedEnd?: number) => {
     const oid = objectId(kind, data);
-    const object = existing.get(oid) ?? objects.get(oid) ?? { kind, data, packed };
+    let object = existing.get(oid) ?? objects.get(oid);
+    if (!object) {
+      const packed = packedEnd === undefined ? undefined : Buffer.from(pack.subarray(offset, packedEnd));
+      object = { kind, data, packed };
+    }
     objects.set(oid, object);
     offsets.set(offset, object);
   };
@@ -281,7 +297,7 @@ export function readPack(pack: Buffer, existing: Objects): Objects {
     }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
     pos += engine.bytesWritten;
     if (data.length !== length) throw new Error('Pack entry size differs');
-    if (base === undefined) add(offset, formats[type] as Kind, data, Buffer.from(pack.subarray(offset, pos)));
+    if (base === undefined) add(offset, formats[type] as Kind, data, pos);
     else pending.push({ offset, base, data });
   }
   if (pos !== end) throw new Error('Trailing bytes in pack');
@@ -315,12 +331,15 @@ function packEntry(object: ObjectData): Buffer {
 }
 
 export function writePack(objects: ObjectData[]): Buffer {
-  const header = Buffer.alloc(12);
-  header.write('PACK');
-  header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(objects.length, 8);
-  const parts = [header, ...objects.map(packEntry)];
-  const hash = createHash('sha1');
-  for (const part of parts) hash.update(part);
-  return Buffer.concat([...parts, hash.digest()]);
+  const entries = objects.map(packEntry);
+  let end = 12;
+  for (const entry of entries) end += entry.length;
+  const pack = Buffer.allocUnsafe(end + 20);
+  pack.write('PACK', 0, 'ascii');
+  pack.writeUInt32BE(2, 4);
+  pack.writeUInt32BE(objects.length, 8);
+  let offset = 12;
+  for (const entry of entries) offset += entry.copy(pack, offset);
+  sha1(pack.subarray(0, end)).copy(pack, end);
+  return pack;
 }
