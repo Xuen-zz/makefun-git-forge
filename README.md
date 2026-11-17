@@ -4,7 +4,17 @@
 [![rank](https://make.fun/badge/github-core-clone-01/Xuen-zz/makefun-git-forge/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![reward](https://make.fun/badge/github-core-clone-01/Xuen-zz/makefun-git-forge/reward.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
-A standalone Git forge for the [make.fun GitHub Core bounty](https://make.fun/bounty/github-core-clone-01). One Node.js process serves Git smart HTTP, REST v3, GraphQL and MCP from a shared in-memory store.
+A standalone Git forge for the [make.fun GitHub Core bounty](https://make.fun/bounty/github-core-clone-01). One process serves Git smart HTTP, REST v3, GraphQL and MCP from a shared in-memory store.
+
+On Linux amd64 the Node entrypoint replaces itself with the tracked Go executable. The executable uses fasthttp, go-git pack storage, and graphql-go. The other supported development platforms use the TypeScript implementation. Both serve Git, REST, GraphQL, and MCP.
+
+Rebuild the Linux executable with Go 1.27.4 using the pinned modules:
+
+```sh
+node native/build.mjs
+```
+
+The builder checks static linkage and the 8 MiB file cap. Dependency licenses are in native/notices.
 
 ## Run locally
 
