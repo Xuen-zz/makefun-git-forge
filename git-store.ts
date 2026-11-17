@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, hash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
 const formats = ['', 'commit', 'tree', 'blob', 'tag'] as const;
@@ -12,7 +12,7 @@ type Objects = Map<string, ObjectData>;
 export const ZERO = '0'.repeat(40);
 export const isOid = (s: unknown): s is string => typeof s === 'string' && /^[0-9a-f]{40}$/.test(s);
 export const branchRef = (branch: string) => `refs/heads/${branch}`;
-export const sha1 = (data: Buffer) => createHash('sha1').update(data).digest();
+export const sha1 = (data: Buffer) => hash('sha1', data, 'buffer');
 const objectId = (kind: Kind, data: Buffer) => createHash('sha1').update(`${kind} ${data.length}\0`).update(data).digest('hex');
 const isTreeMode = (mode: string) => mode === '40000' || mode === '040000';
 

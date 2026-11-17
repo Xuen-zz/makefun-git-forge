@@ -2,6 +2,7 @@ import { asCommit, branchRef, GitStore, isOid, readPack, references, validRef, w
 
 const FLUSH = Buffer.from('0000');
 const DELIMITER = Buffer.from('0001');
+const EMPTY = Buffer.alloc(0);
 const ADVERTISE_V2 = Buffer.concat([
   ...['version 2\n', 'ls-refs=unborn\n', 'fetch=shallow\n', 'object-format=sha1\n', 'agent=makefun-forge/1.0\n'].map(packet),
   FLUSH,
@@ -9,6 +10,11 @@ const ADVERTISE_V2 = Buffer.concat([
 const AGENT = 'agent=makefun-forge/1.0';
 const RECEIVE_CAPS = `report-status delete-refs side-band-64k ofs-delta object-format=sha1 ${AGENT}`;
 const UPLOAD_CAPS = `shallow deepen-relative side-band-64k ofs-delta include-tag object-format=sha1 ${AGENT}`;
+const RECEIVE_PREAMBLE = packet('# service=git-receive-pack\n');
+const UPLOAD_PREAMBLE = packet('# service=git-upload-pack\n');
+const UNPACK_OK = packet('unpack ok\n');
+const UNPACK_INVALID = packet('unpack invalid pack\n');
+const pushSuccess = new WeakMap<GitStore, { ref: string; plain: Buffer; banded: Buffer }>();
 
 type Target = { git: GitStore; defaultBranch: string };
 type Packets = { lines: string[]; offset: number; ended: boolean };
@@ -58,17 +64,16 @@ function listRefs({ git, defaultBranch }: Target, receive: boolean): Ref[] {
 
 export function advertise(target: Target, receive: boolean, v2: boolean): Buffer {
   if (!receive && v2) return ADVERTISE_V2;
-  const service = receive ? 'git-receive-pack' : 'git-upload-pack';
-  const head = branchRef(target.defaultBranch);
-  const caps = receive ? RECEIVE_CAPS : `${UPLOAD_CAPS} symref=HEAD:${head}`;
+  const caps = receive ? RECEIVE_CAPS : `${UPLOAD_CAPS} symref=HEAD:${branchRef(target.defaultBranch)}`;
   const refs = listRefs(target, receive);
-  const parts = [packet(`# service=${service}\n`), FLUSH];
+  const parts = [receive ? RECEIVE_PREAMBLE : UPLOAD_PREAMBLE, FLUSH];
   if (!refs.length) parts.push(packet(`${ZERO} capabilities^{}\0${caps}\n`));
   for (const [i, { oid, name, peeled }] of refs.entries()) {
     parts.push(packet(`${oid} ${name}${i === 0 ? `\0${caps}` : ''}\n`));
     if (peeled) parts.push(packet(`${peeled} ${name}^{}\n`));
   }
-  return Buffer.concat([...parts, FLUSH]);
+  parts.push(FLUSH);
+  return Buffer.concat(parts);
 }
 
 function lsRefs(target: Target, lines: string[]): Buffer {
@@ -178,7 +183,8 @@ export function upload(target: Target, body: Buffer, v2: boolean): Buffer {
       cache = { version: git.refVersion, branch: target.defaultBranch };
       uploadCache.set(git, cache);
     }
-    for (const entry of [cache.refs, cache.shallow]) if (entry?.request.equals(body)) return entry.response;
+    if (cache.refs?.request.equals(body)) return cache.refs.response;
+    if (cache.shallow?.request.equals(body)) return cache.shallow.response;
   }
   const first = readPackets(body);
   if (!first.ended) throw new Error('Missing flush packet');
@@ -244,7 +250,9 @@ export function receive({ git }: Target, body: Buffer): Buffer {
     unpacked = false;
   }
   const lookup = (oid: string) => git.objects.get(oid) ?? quarantine.get(oid);
-  const report = [packet(unpacked ? 'unpack ok\n' : 'unpack invalid pack\n')];
+  const report = [unpacked ? UNPACK_OK : UNPACK_INVALID];
+  const reportStatus = caps.includes('report-status');
+  const banded = caps.includes('side-band-64k');
   for (const { old, next, ref } of parsed) {
     let error = '';
     const current = git.refs.get(ref) ?? ZERO;
@@ -273,11 +281,23 @@ export function receive({ git }: Target, body: Buffer): Buffer {
         error = 'invalid object graph';
       }
     }
-    report.push(packet(error ? `ng ${ref} ${error}\n` : `ok ${ref}\n`));
+    if (reportStatus) {
+      if (!error && parsed.length === 1) {
+        // Repeat pushes to the same ref have an identical success report, after validation.
+        let cached = pushSuccess.get(git);
+        if (cached?.ref !== ref) {
+          const plain = Buffer.concat([UNPACK_OK, packet(`ok ${ref}\n`), FLUSH]);
+          cached = { ref, plain, banded: Buffer.concat([...sideband(plain), FLUSH]) };
+          pushSuccess.set(git, cached);
+        }
+        return banded ? cached.banded : cached.plain;
+      }
+      report.push(packet(error ? `ng ${ref} ${error}\n` : `ok ${ref}\n`));
+    }
   }
-  if (!caps.includes('report-status')) return Buffer.alloc(0);
+  if (!reportStatus) return EMPTY;
   const inner = Buffer.concat([...report, FLUSH]);
-  return caps.includes('side-band-64k') ? Buffer.concat([...sideband(inner), FLUSH]) : inner;
+  return banded ? Buffer.concat([...sideband(inner), FLUSH]) : inner;
 }
 
 function refCollides(refs: ReadonlyMap<string, string>, ref: string) {
@@ -286,6 +306,8 @@ function refCollides(refs: ReadonlyMap<string, string>, ref: string) {
 }
 
 function hasAncestor(git: GitStore, next: string, old: string, lookup: (oid: string) => ReturnType<GitStore['objects']['get']>) {
+  // The common single-commit push can prove a fast-forward without opening a history walk.
+  if (asCommit(lookup(next))?.parents.includes(old) && asCommit(lookup(old))) return true;
   for (const oid of git.history(next, lookup)) if (oid === old) return true;
   return false;
 }

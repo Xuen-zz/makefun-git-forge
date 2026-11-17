@@ -1,16 +1,33 @@
 import type { ServerResponse } from 'node:http';
 import { asCommit, branchRef } from './git-store.ts';
-import { contents, createRef, Forge, HttpError, optionalString, pullFiles, pullView, requireValue, requiredString, updateContents, type Body } from './forge.ts';
+import { contents, createRef, Forge, HttpError, optionalString, pullFiles, pullView, requireValue, requiredString, updateContents, type Body, type Repository } from './forge.ts';
 
 export const JSON_TYPE = 'application/json; charset=utf-8';
 
 export function sendJson(res: ServerResponse, status: number, value: unknown, headers?: Record<string, string>) {
-  sendJsonText(res, status, JSON.stringify(value), headers);
+  const text = JSON.stringify(value);
+  sendJsonBody(res, status, text, Buffer.byteLength(text), headers);
 }
 
-function sendJsonText(res: ServerResponse, status: number, text: string, headers?: Record<string, string>) {
-  res.writeHead(status, { 'Content-Type': JSON_TYPE, 'Content-Length': String(Buffer.byteLength(text)), ...headers });
+function sendJsonBody(res: ServerResponse, status: number, text: string, size: number, headers?: Record<string, string>) {
+  if (headers) res.writeHead(status, { 'Content-Type': JSON_TYPE, 'Content-Length': size, ...headers });
+  else res.writeHead(status, { 'Content-Type': JSON_TYPE, 'Content-Length': size });
   res.end(text);
+}
+
+export function sendIssue(res: ServerResponse, repo: Repository, number: number) {
+  let encoded = repo.issueJson.get(number);
+  if (encoded === undefined) {
+    const issue = repo.issues.get(number);
+    if (!issue) {
+      const pull = requireValue(repo.pulls.get(number));
+      return sendJson(res, 200, { ...pullView(repo, pull), pull_request: { url: `${repo.apiPath}/pulls/${number}` } });
+    }
+    const text = JSON.stringify(issue);
+    encoded = { text, bytes: Buffer.byteLength(text) };
+    repo.issueJson.set(number, encoded);
+  }
+  return sendJsonBody(res, 200, encoded.text, encoded.bytes);
 }
 
 export function pathParts(path: string): string[] {
@@ -42,7 +59,7 @@ export function filterState<T extends { state: string }>(records: Iterable<T>, s
   return [...records].filter(record => state === 'all' || record.state === state);
 }
 
-const bodyObject = (data: unknown): Body => {
+export const bodyObject = (data: unknown): Body => {
   if (data === null || typeof data !== 'object' || Array.isArray(data)) throw new HttpError(400, 'Expected a JSON object');
   return data as Body;
 };
@@ -143,16 +160,8 @@ export function rest(forge: Forge, method: string, url: URL, res: ServerResponse
       }
     } else {
       const number = positive(tail[0], 0);
+      if (tail.length === 1 && is('GET')) return sendIssue(res, repo, number);
       const issue = repo.issues.get(number);
-      if (tail.length === 1 && is('GET')) {
-        if (!issue) {
-          const pull = requireValue(repo.pulls.get(number));
-          return respond(200, { ...pullView(repo, pull), pull_request: { url: `${repo.apiPath}/pulls/${number}` } });
-        }
-        let encoded = repo.issueJson.get(number);
-        if (encoded === undefined) { encoded = JSON.stringify(issue); repo.issueJson.set(number, encoded); }
-        return sendJsonText(res, 200, encoded);
-      }
       if (tail.length === 1 && is('PATCH')) return respond(200, forge.editIssue(repo, requireValue(issue), input));
       if (tail.length === 2 && tail[1] === 'comments') {
         if (is('POST')) return respond(201, forge.comment(repo, number, input));

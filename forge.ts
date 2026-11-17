@@ -49,7 +49,7 @@ export class Repository {
   readonly pulls = new Map<number, Pull>();
   readonly labels = new Map<string, Label>();
   readonly comments = new Map<number, Comment[]>();
-  readonly issueJson = new Map<number, string>();
+  readonly issueJson = new Map<number, { text: string; bytes: number }>();
 
   constructor(id: number, name: string, owner: User, data: Body, now: string) {
     this.id = id;
@@ -78,6 +78,7 @@ export class Repository {
 
 export class Forge {
   readonly owner: User;
+  private readonly ownerKey: string;
   readonly repos = new Map<string, Repository>();
   readonly nodes = new Map<string, { repo: Repository; kind: 'Repository' | 'Issue' | 'PullRequest' | 'IssueComment'; number?: number }>();
   private globalId = 1001;
@@ -86,6 +87,7 @@ export class Forge {
 
   constructor(login: string, time: string) {
     this.owner = { id: 1, node_id: nodeId('User', 1), login, type: 'User' };
+    this.ownerKey = login.toLowerCase();
     const parsed = Date.parse(time);
     this.epoch = Number.isFinite(parsed) ? parsed : 0;
   }
@@ -93,7 +95,7 @@ export class Forge {
   now(): string { return new Date(this.epoch + this.ticks++ * 1000).toISOString(); }
 
   find(owner: string, name: string): Repository | undefined {
-    return owner.toLowerCase() === this.owner.login.toLowerCase() ? this.repos.get(name.toLowerCase()) : undefined;
+    return owner.toLowerCase() === this.ownerKey ? this.repos.get(name.toLowerCase()) : undefined;
   }
 
   createRepo(body: Body): Repository {
