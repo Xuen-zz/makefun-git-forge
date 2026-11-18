@@ -2,12 +2,12 @@ package main
 
 import (
 	"bytes"
-	"compress/zlib"
 	"errors"
 	"io"
 	"sync"
 
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/klauspost/compress/zlib"
 )
 
 var needsDeltaResolution = errors.New("pack contains deltas")
