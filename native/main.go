@@ -89,6 +89,7 @@ type store struct {
 	repos    map[string]*repository
 	nodes    map[string]any
 	sequence atomic.Uint64
+	revision atomic.Uint64
 	nextID   int
 	clock    time.Time
 	user     user

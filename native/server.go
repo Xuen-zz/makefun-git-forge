@@ -8,7 +8,7 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"strconv"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -36,9 +36,15 @@ func (s *store) httpResponse(method, path, host, rawQuery, service, protocol, cr
 		owner, rest, _ := strings.Cut(strings.TrimPrefix(path, "/"), "/")
 		if name, route, ok := strings.Cut(rest, ".git/"); ok && name != "" && !strings.Contains(name, "/") {
 			if route == "info/refs" || route == receiveService || route == uploadService {
+				if method == "POST" && route == receiveService {
+					defer s.revision.Add(1)
+				}
 				return s.gitHTTP(method, owner, name, route, service, protocol, credential, encoding, body)
 			}
 		}
+	}
+	if method != "GET" && method != "HEAD" {
+		defer s.revision.Add(1)
 	}
 	isRest := path == "/api/v3" || strings.HasPrefix(path, "/api/v3/")
 	if !isRest && path != "/api/graphql" && path != "/mcp" {
@@ -62,43 +68,6 @@ func (s *store) httpResponse(method, path, host, rawQuery, service, protocol, cr
 		return s.serveGraphQL(method, body)
 	}
 	return s.mcp(method, origin, body)
-}
-
-func (s *store) handler(ctx *fasthttp.RequestCtx) {
-	path := string(ctx.Path())
-	uri := ctx.URI()
-	query := ""
-	service := ""
-	if raw := uri.QueryString(); len(raw) > 0 {
-		query = string(raw)
-		if strings.HasSuffix(path, ".git/info/refs") {
-			service = string(ctx.QueryArgs().Peek("service"))
-		}
-	}
-	headers := &ctx.Request.Header
-	reply := s.httpResponse(string(ctx.Method()), path, string(ctx.Host()), query, service, string(headers.Peek("Git-Protocol")),
-		string(headers.Peek("Authorization")), string(headers.Peek("Content-Encoding")), ctx.PostBody())
-	if path != "/mcp" && path != "/api/graphql" {
-		ctx.Response.Header.Set("X-GitHub-Request-Id", strconv.FormatUint(s.sequence.Add(1), 16))
-	}
-	ctx.Response.Header.SetContentType(reply.typ)
-	if reply.challenge {
-		ctx.Response.Header.Set("WWW-Authenticate", "Basic realm=\"Git forge\"")
-	}
-	if strings.HasPrefix(reply.typ, "application/x-git-") {
-		ctx.Response.Header.Set("Cache-Control", "no-cache")
-	}
-	if reply.link != "" {
-		ctx.Response.Header.Set("Link", reply.link)
-	}
-	if reply.scopes != "" {
-		ctx.Response.Header.Set("X-OAuth-Scopes", reply.scopes)
-	}
-	if reply.allow != "" {
-		ctx.Response.Header.Set("Allow", reply.allow)
-	}
-	ctx.SetStatusCode(reply.status)
-	ctx.Response.SetBodyRaw(reply.body)
 }
 
 func environmentCall(client *fasthttp.Client, method, endpoint string, body []byte, timeout time.Duration) (int, []byte, error) {
@@ -174,11 +143,7 @@ func run() error {
 		return err
 	}
 	defer listener.Close()
-	server := &fasthttp.Server{
-		Handler: s.handler, MaxRequestBodySize: maxBody,
-		ReadTimeout: 30 * time.Second, IdleTimeout: 20 * time.Second,
-		NoDefaultServerHeader: true, DisablePreParseMultipartForm: true, LazyRequestTime: true,
-	}
+	server := forgeHTTPServer{store: s}
 	port := listener.Addr().(*net.TCPAddr).Port
 	fmt.Println(port)
 	if env == "" {
@@ -189,6 +154,13 @@ func run() error {
 	return awaitTrial(env, port, serveErr)
 }
 func main() {
+	// Leave memory for the client sharing the pod while collecting less often.
+	if _, supplied := os.LookupEnv("GOGC"); !supplied {
+		debug.SetGCPercent(400)
+	}
+	if _, supplied := os.LookupEnv("GOMEMLIMIT"); !supplied {
+		debug.SetMemoryLimit(384 << 20)
+	}
 	if err := run(); err != nil {
 		log.Fatal(err)
 	}

@@ -9,20 +9,13 @@ mkdirSync(outputDir, { recursive: true });
 
 execFileSync(process.env.FORGE_GO ?? 'go', [
   'build', '-mod=readonly', '-trimpath', '-ldflags=-s -w',
-  // Keep HTTP, Git plumbing and forge handlers inlined. The remaining packages
-  // use the smaller code generation profile to stay within the single-file limit.
-  '-gcflags=all=-l',
-  '-gcflags=github.com/valyala/fasthttp=',
-  '-gcflags=github.com/go-git/go-git/v5/plumbing/...=',
-  '-gcflags=forge-transport-probe=',
-  '-gcflags=encoding/json=',
-  '-gcflags=compress/...=',
-  '-gcflags=net=',
-  '-gcflags=bufio=',
-  '-gcflags=sync=',
-  '-gcflags=runtime=',
-  '-gcflags=internal/poll=',
-  '-gcflags=github.com/pjbgf/sha1cd=',
+  // Keep the hot paths optimized. Cold GraphQL and crypto code use smaller
+  // code generation so the static executable stays within the file limit.
+  '-gcflags=github.com/graphql-go/graphql/...=-l',
+  '-gcflags=crypto/...=-l',
+  '-gcflags=crypto/sha1=',
+  '-gcflags=crypto/sha256=',
+  '-gcflags=crypto/subtle=',
   '-o', output, '.',
 ], {
   cwd,
