@@ -53,11 +53,18 @@ func (s *forgeHTTPServer) serveConn(conn net.Conn) {
 	wire := make([]byte, 0, 4096)
 	var cached [3]connectionReply
 	nextUpload := 1
+	var nextDeadlineUpdate time.Time
 	for {
 		request.Reset()
 		request.KeepBodyBuffer = true
-		if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
-			return
+		// Renew active connections in batches. The deadline on a stalled
+		// request is still at most 30 seconds, with up to 250 ms of rounding.
+		now := time.Now()
+		if !now.Before(nextDeadlineUpdate) {
+			if err := conn.SetDeadline(now.Add(30 * time.Second)); err != nil {
+				return
+			}
+			nextDeadlineUpdate = now.Add(250 * time.Millisecond)
 		}
 		if err := request.Header.Read(reader); err != nil {
 			var networkErr net.Error

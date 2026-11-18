@@ -146,13 +146,13 @@ func readLinks(obj plumbing.EncodedObject) (objectLinks, error) {
 }
 
 type stagedPack struct {
-	*memory.Storage
+	objects  map[plumbing.Hash]plumbing.EncodedObject
 	existing *memory.Storage
 	total    int64
 }
 
 func (s *stagedPack) EncodedObject(kind plumbing.ObjectType, id plumbing.Hash) (plumbing.EncodedObject, error) {
-	if obj, err := s.Storage.EncodedObject(kind, id); err == nil {
+	if obj := s.objects[id]; obj != nil && (kind == plumbing.AnyObject || obj.Type() == kind) {
 		return obj, nil
 	}
 	return s.existing.EncodedObject(kind, id)
@@ -164,11 +164,37 @@ func (s *stagedPack) SetEncodedObject(object plumbing.EncodedObject) (plumbing.H
 		return plumbing.ZeroHash, badPack
 	}
 	s.total += size
-	return s.Storage.SetEncodedObject(object)
+	switch object.Type() {
+	case plumbing.CommitObject, plumbing.TreeObject, plumbing.BlobObject, plumbing.TagObject:
+	default:
+		return plumbing.ZeroHash, badPack
+	}
+	if s.objects == nil {
+		s.objects = make(map[plumbing.Hash]plumbing.EncodedObject)
+	}
+	id := object.Hash()
+	s.objects[id] = object
+	return id, nil
+}
+
+// The delta parser uses the staged read and write methods. The embedded
+// store supplies the rest of its object-storage interface without exposing
+// the live repository to writes.
+type deltaPackStorage struct {
+	*stagedPack
+	*memory.Storage
+}
+
+func (s deltaPackStorage) EncodedObject(kind plumbing.ObjectType, id plumbing.Hash) (plumbing.EncodedObject, error) {
+	return s.stagedPack.EncodedObject(kind, id)
+}
+
+func (s deltaPackStorage) SetEncodedObject(object plumbing.EncodedObject) (plumbing.Hash, error) {
+	return s.stagedPack.SetEncodedObject(object)
 }
 
 func (r *gitRepository) decodePack(data []byte) (*stagedPack, error) {
-	staged := &stagedPack{Storage: memory.NewStorage(), existing: r.db}
+	staged := &stagedPack{existing: r.db}
 	if len(data) == 0 {
 		return staged, nil
 	}
@@ -187,10 +213,10 @@ func (r *gitRepository) decodePack(data []byte) (*stagedPack, error) {
 		}
 		return staged, nil
 	}
-	staged = &stagedPack{Storage: memory.NewStorage(), existing: r.db}
+	staged = &stagedPack{existing: r.db}
 	scan := packfile.NewScanner(bytes.NewReader(data))
 	defer scan.Close()
-	parser, err := packfile.NewParserWithStorage(scan, staged)
+	parser, err := packfile.NewParserWithStorage(scan, deltaPackStorage{staged, memory.NewStorage()})
 	if err != nil {
 		return nil, err
 	}
@@ -214,7 +240,7 @@ func (r *gitRepository) closure(staged *stagedPack, tip plumbing.Hash) (map[plum
 		if _, ok := found[id]; ok {
 			continue
 		}
-		obj := staged.Objects[id]
+		obj := staged.objects[id]
 		if obj == nil {
 			return nil, badGraph
 		}

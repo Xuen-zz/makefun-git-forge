@@ -163,7 +163,7 @@ func (r *gitRepository) update(op refUpdate, staged *stagedPack) string {
 		return "non-fast-forward"
 	}
 	for id, meta := range objects {
-		if _, err := r.db.SetEncodedObject(staged.Objects[id]); err != nil {
+		if _, err := r.db.SetEncodedObject(staged.objects[id]); err != nil {
 			return "invalid object"
 		}
 		r.objects[id] = meta

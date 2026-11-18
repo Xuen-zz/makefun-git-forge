@@ -43,7 +43,7 @@ func TestFullPackObjectSizesAndChecksum(t *testing.T) {
 			t.Fatal(err)
 		}
 		hash := plumbing.ComputeHash(plumbing.BlobObject, valid)
-		if obj := pack.Objects[hash]; obj == nil || obj.Type() != plumbing.BlobObject || obj.Size() != int64(len(valid)) {
+		if obj := pack.objects[hash]; obj == nil || obj.Type() != plumbing.BlobObject || obj.Size() != int64(len(valid)) {
 			t.Fatal("decoded object or its metadata is missing")
 		}
 	}
