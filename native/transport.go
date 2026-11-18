@@ -16,6 +16,7 @@ import (
 type connectionReply struct {
 	target, host, credential, path, method, protocol, encoding string
 	body                                                       []byte
+	wireRequest                                                []byte
 	revision                                                   uint64
 	reply                                                      httpReply
 }
@@ -66,6 +67,36 @@ func (s *forgeHTTPServer) serveConn(conn net.Conn) {
 			}
 			nextDeadlineUpdate = now.Add(250 * time.Millisecond)
 		}
+		// A cached bodyless GET may repeat byte for byte on a keep-alive
+		// connection. The complete head includes authorization and all request
+		// headers, and came from a prior successful parse on this connection.
+		var bufferedGET []byte
+		bufferedBefore := 0
+		if _, peekErr := reader.Peek(1); peekErr == nil {
+			slot := &cached[0]
+			if n := len(slot.wireRequest); n != 0 && n <= reader.Buffered() {
+				view, _ := reader.Peek(n)
+				if bytes.Equal(view, slot.wireRequest) && slot.revision == s.store.revision.Load() {
+					_, _ = reader.Discard(n)
+					var sequence uint64
+					if slot.path != "/mcp" && slot.path != "/api/graphql" {
+						sequence = s.store.sequence.Add(1)
+					}
+					wire = appendHTTPReply(wire[:0], slot.reply, "GET", sequence, false)
+					if _, err := conn.Write(wire); err != nil {
+						return
+					}
+					continue
+				}
+			}
+			bufferedBefore = reader.Buffered()
+			view, _ := reader.Peek(bufferedBefore)
+			if bytes.HasPrefix(view, []byte("GET ")) {
+				if end := bytes.Index(view, []byte("\r\n\r\n")); end >= 0 {
+					bufferedGET = view[:end+4]
+				}
+			}
+		}
 		if err := request.Header.Read(reader); err != nil {
 			var networkErr net.Error
 			if !errors.Is(err, io.EOF) && !(errors.As(err, &networkErr) && networkErr.Timeout()) {
@@ -78,6 +109,11 @@ func (s *forgeHTTPServer) serveConn(conn net.Conn) {
 			}
 			return
 		}
+		contentLength := request.Header.ContentLength()
+		if len(bufferedGET) != bufferedBefore-reader.Buffered() ||
+			(contentLength != 0 && contentLength != -2) || request.MayContinue() {
+			bufferedGET = nil
+		}
 		if request.MayContinue() {
 			if request.Header.ContentLength() > maxBody {
 				wire = appendHTTPReply(wire[:0], httpReply{status: 413, typ: contentType, body: missing}, "", 0, true)
@@ -88,9 +124,13 @@ func (s *forgeHTTPServer) serveConn(conn net.Conn) {
 				return
 			}
 		}
-		if err := request.ContinueReadBody(reader, maxBody, false); err != nil {
+		var bodyErr error
+		if contentLength != 0 && contentLength != -2 {
+			bodyErr = request.ContinueReadBody(reader, maxBody, false)
+		}
+		if bodyErr != nil {
 			status := 400
-			if err == fasthttp.ErrBodyTooLarge {
+			if bodyErr == fasthttp.ErrBodyTooLarge {
 				status = 413
 			}
 			wire = appendHTTPReply(wire[:0], httpReply{status: status, typ: contentType, body: missing}, "", 0, true)
@@ -136,6 +176,9 @@ func (s *forgeHTTPServer) serveConn(conn net.Conn) {
 					cached[nextUpload] = entry
 					nextUpload = 3 - nextUpload
 				} else {
+					if !headers.ConnectionClose() {
+						entry.wireRequest = bytes.Clone(bufferedGET)
+					}
 					cached[0] = entry
 				}
 			}
