@@ -19,6 +19,11 @@ execFileSync(process.env.FORGE_GO ?? 'go', [
   '-gcflags=github.com/klauspost/compress/zlib=-l',
   '-gcflags=mime/...=-l',
   '-gcflags=github.com/valyala/fasthttp/...=-l',
+  '-gcflags=regexp/...=-l',
+  '-gcflags=math/big=-l',
+  '-gcflags=vendor/golang.org/x/...=-l',
+  '-gcflags=github.com/go-git/go-git/v5/plumbing/format/diff/...=-l',
+  '-gcflags=encoding/json/...=-l',
   '-o', output, '.',
 ], {
   cwd,
