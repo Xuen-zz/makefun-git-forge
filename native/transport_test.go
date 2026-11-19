@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -102,5 +103,32 @@ func TestHTTPFramingAndCacheInvalidation(t *testing.T) {
 	io.WriteString(conn, "GET /api/v3/repos/adaiversen/cache/issues/1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\nConnection: close\r\n\r\n")
 	if !strings.Contains(testHTTPResponse(t, reader, 200), `"state":"closed"`) {
 		t.Fatal("missing closed state after fallback")
+	}
+}
+
+func TestFastIssueCreateAndEncodeMatchesStdlib(t *testing.T) {
+	store := newStore("adaiversen", "test-token", "2026-10-28T00:00:00.345Z")
+	repo := store.createRepo(mapJSON{"name": "fast-issues"})
+	title := "Issue <one> & \"two\" \t\n\\ok"
+	bodyText := "Body <script> & line\nend"
+	iss := store.createIssueValues(repo, title, bodyText, []*label{})
+	got := store.encodeIssue(iss)
+	want := encoded(iss)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("encodeIssue mismatch:\ngot:  %s\nwant: %s", got, want)
+	}
+	if !strings.HasSuffix(iss.Created, ".345Z") {
+		t.Fatalf("expected .345Z suffix, got %q", iss.Created)
+	}
+	if titleParsed, bodyParsed, ok := parseIssueCreateFast([]byte(` {"title" : "hello" , "body" : "world" } `)); !ok || titleParsed != "hello" || bodyParsed != "world" {
+		t.Fatalf("unexpected fast parse result: ok=%v title=%q body=%q", ok, titleParsed, bodyParsed)
+	}
+	for _, fallbackCase := range []string{
+		``, `null`, `[]`, `{"title":""}`, `{"title":"   "}`, `{"title":"a","labels":["x"]}`,
+		`{"title":"a"} trailing`, `{"title":"a","body":123}`, `{"title":"a\nb"}`,
+	} {
+		if _, _, ok := parseIssueCreateFast([]byte(fallbackCase)); ok {
+			t.Fatalf("expected fallback for %q", fallbackCase)
+		}
 	}
 }

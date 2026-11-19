@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/go-git/go-git/v5/plumbing"
 )
@@ -73,9 +74,179 @@ func parseBody(body []byte) mapJSON {
 	}
 	return data
 }
+func skipJSONSpace(b []byte, i int) int {
+	for i < len(b) {
+		switch b[i] {
+		case ' ', '\t', '\r', '\n':
+			i++
+		default:
+			return i
+		}
+	}
+	return i
+}
+func scanPlainJSONString(b []byte, i int) (string, int, bool) {
+	if i >= len(b) || b[i] != '"' {
+		return "", i, false
+	}
+	i++
+	start := i
+	for i < len(b) {
+		c := b[i]
+		if c == '"' {
+			return string(b[start:i]), i + 1, true
+		}
+		if c == '\\' || c < 0x20 || c >= 0x80 {
+			return "", i, false
+		}
+		i++
+	}
+	return "", i, false
+}
+func parseIssueCreateFast(body []byte) (title, issueBody string, ok bool) {
+	if len(body) == 0 || !utf8.Valid(body) {
+		return "", "", false
+	}
+	i := skipJSONSpace(body, 0)
+	if i >= len(body) || body[i] != '{' {
+		return "", "", false
+	}
+	i = skipJSONSpace(body, i+1)
+	if i >= len(body) || body[i] == '}' {
+		return "", "", false
+	}
+	hasTitle := false
+	for {
+		key, next, okKey := scanPlainJSONString(body, i)
+		if !okKey {
+			return "", "", false
+		}
+		i = skipJSONSpace(body, next)
+		if i >= len(body) || body[i] != ':' {
+			return "", "", false
+		}
+		i = skipJSONSpace(body, i+1)
+		val, nextVal, okVal := scanPlainJSONString(body, i)
+		if !okVal {
+			return "", "", false
+		}
+		switch key {
+		case "title":
+			title = val
+			hasTitle = true
+		case "body":
+			issueBody = val
+		default:
+			return "", "", false
+		}
+		i = skipJSONSpace(body, nextVal)
+		if i >= len(body) {
+			return "", "", false
+		}
+		if body[i] == '}' {
+			i = skipJSONSpace(body, i+1)
+			if i != len(body) || !hasTitle || strings.TrimSpace(title) == "" {
+				return "", "", false
+			}
+			return title, issueBody, true
+		}
+		if body[i] != ',' {
+			return "", "", false
+		}
+		i = skipJSONSpace(body, i+1)
+	}
+}
+func appendJSONString(dst []byte, s string) []byte {
+	const hexDigits = "0123456789abcdef"
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			b, _ := json.Marshal(s)
+			return append(dst, b...)
+		}
+	}
+	dst = append(dst, '"')
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 0x20 && c != '"' && c != '\\' && c != '<' && c != '>' && c != '&' {
+			continue
+		}
+		dst = append(dst, s[start:i]...)
+		switch c {
+		case '"', '\\':
+			dst = append(dst, '\\', c)
+		case '\b':
+			dst = append(dst, '\\', 'b')
+		case '\f':
+			dst = append(dst, '\\', 'f')
+		case '\n':
+			dst = append(dst, '\\', 'n')
+		case '\r':
+			dst = append(dst, '\\', 'r')
+		case '\t':
+			dst = append(dst, '\\', 't')
+		default:
+			dst = append(dst, '\\', 'u', '0', '0', hexDigits[c>>4], hexDigits[c&15])
+		}
+		start = i + 1
+	}
+	dst = append(dst, s[start:]...)
+	return append(dst, '"')
+}
+func (s *store) encodeIssue(i *issue) []byte {
+	if len(i.Labels) != 0 || i.Closed != nil {
+		return encoded(i)
+	}
+	dst := make([]byte, 0, 320+len(i.Title)+len(i.Body))
+	dst = append(dst, "{\"id\":"...)
+	dst = strconv.AppendInt(dst, int64(i.ID), 10)
+	dst = append(dst, ",\"node_id\":"...)
+	dst = appendJSONString(dst, i.NodeID)
+	dst = append(dst, ",\"number\":"...)
+	dst = strconv.AppendInt(dst, int64(i.Number), 10)
+	dst = append(dst, ",\"title\":"...)
+	dst = appendJSONString(dst, i.Title)
+	dst = append(dst, ",\"body\":"...)
+	dst = appendJSONString(dst, i.Body)
+	dst = append(dst, ",\"state\":"...)
+	dst = appendJSONString(dst, i.State)
+	dst = append(dst, ",\"labels\":[],\"user\":"...)
+	dst = append(dst, s.userJSON...)
+	dst = append(dst, ",\"created_at\":"...)
+	dst = appendJSONString(dst, i.Created)
+	dst = append(dst, ",\"updated_at\":"...)
+	dst = appendJSONString(dst, i.Updated)
+	dst = append(dst, ",\"closed_at\":null,\"comments\":"...)
+	dst = strconv.AppendInt(dst, int64(i.Comments), 10)
+	return append(dst, '}')
+}
 func (s *store) rest(method, requestPath, origin, rawQuery string, body []byte) httpReply {
 	path := strings.Trim(strings.TrimPrefix(requestPath, "/api/v3"), "/")
-	q, _ := url.ParseQuery(rawQuery)
+	var q url.Values
+	if rawQuery != "" {
+		q, _ = url.ParseQuery(rawQuery)
+	}
+	if method == "POST" && strings.HasPrefix(path, "repos/") && strings.HasSuffix(path, "/issues") {
+		if title, issueBody, ok := parseIssueCreateFast(body); ok {
+			seg0, restPath, ok := strings.Cut(path, "/")
+			if ok && seg0 == "repos" {
+				owner, restPath, ok := strings.Cut(restPath, "/")
+				if ok {
+					repoName, restPath, hasMore := strings.Cut(restPath, "/")
+					if hasMore && restPath == "issues" {
+						r := s.find(owner, repoName)
+						if r == nil {
+							reject(404, "Not Found")
+						}
+						i := s.createIssueValues(r, title, issueBody, []*label{})
+						encodedBody := s.encodeIssue(i)
+						r.issueJSON[i.Number] = encodedBody
+						return httpReply{status: 201, typ: contentType, body: encodedBody}
+					}
+				}
+			}
+		}
+	}
 	var input mapJSON
 	if method == "POST" || method == "PUT" || method == "PATCH" || method == "DELETE" {
 		input = parseBody(body)
@@ -108,15 +279,20 @@ func (s *store) rest(method, requestPath, origin, rawQuery string, body []byte) 
 			return pageJSON(rows, q, origin, requestPath)
 		}
 	}
-	p := strings.SplitN(path, "/", 5)
-	if len(p) < 3 || p[0] != "repos" {
+	seg0, restPath, ok := strings.Cut(path, "/")
+	if !ok || seg0 != "repos" {
 		reject(404, "Not Found")
 	}
-	r := s.find(p[1], p[2])
+	owner, restPath, ok := strings.Cut(restPath, "/")
+	if !ok {
+		reject(404, "Not Found")
+	}
+	repoName, restPath, hasMore := strings.Cut(restPath, "/")
+	r := s.find(owner, repoName)
 	if r == nil {
 		reject(404, "Not Found")
 	}
-	if len(p) == 3 {
+	if !hasMore {
 		switch method {
 		case "GET":
 			return jsonReply(200, r.view(origin))
@@ -145,11 +321,7 @@ func (s *store) rest(method, requestPath, origin, rawQuery string, body []byte) 
 		}
 		reject(404, "Not Found")
 	}
-	section := p[3]
-	tail := ""
-	if len(p) == 5 {
-		tail = p[4]
-	}
+	section, tail, _ := strings.Cut(restPath, "/")
 	switch section {
 	case "issues":
 		return s.restIssues(r, method, tail, requestPath, origin, q, input)
@@ -292,9 +464,9 @@ func (s *store) restIssues(r *repository, method, tail, requestPath, origin stri
 	if tail == "" {
 		if method == "POST" {
 			i := s.createIssue(r, input)
-			result := jsonReply(201, i)
-			r.issueJSON[i.Number] = result.body
-			return result
+			encodedBody := s.encodeIssue(i)
+			r.issueJSON[i.Number] = encodedBody
+			return httpReply{status: 201, typ: contentType, body: encodedBody}
 		}
 		if method == "GET" {
 			asc := q.Get("direction") == "asc"
@@ -342,7 +514,7 @@ func (s *store) restIssues(r *repository, method, tail, requestPath, origin stri
 			if i != nil {
 				data := r.issueJSON[n]
 				if data == nil {
-					data = encoded(i)
+					data = s.encodeIssue(i)
 					r.issueJSON[n] = data
 				}
 				return httpReply{status: 200, typ: contentType, body: data}

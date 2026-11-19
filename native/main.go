@@ -93,6 +93,7 @@ type store struct {
 	nextID   int
 	clock    time.Time
 	user     user
+	userJSON []byte
 	token    string
 	gql      *querySchema
 }
@@ -102,14 +103,55 @@ func newStore(login, token, epoch string) *store {
 	if err != nil {
 		clock = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 	}
-	s := &store{repos: make(map[string]*repository), nodes: make(map[string]any), nextID: 1001, clock: clock.UTC(), user: user{1, nodeID("User", 1), login, "User"}, token: token}
+	u := user{1, nodeID("User", 1), login, "User"}
+	s := &store{repos: make(map[string]*repository), nodes: make(map[string]any), nextID: 1001, clock: clock.UTC(), user: u, userJSON: encoded(u), token: token}
 	s.gql = newQuerySchema(s)
 	return s
 }
 func (s *store) allocate() int      { id := s.nextID; s.nextID++; return id }
 func (s *store) advance() time.Time { t := s.clock; s.clock = s.clock.Add(time.Second); return t }
-func (s *store) now() string        { return s.advance().Format("2006-01-02T15:04:05.000Z") }
+func (s *store) now() string {
+	t := s.advance()
+	year, month, day := t.Date()
+	hour, minute, sec := t.Clock()
+	ms := t.Nanosecond() / 1_000_000
+	var buf [24]byte
+	buf[0] = byte('0' + year/1000%10)
+	buf[1] = byte('0' + year/100%10)
+	buf[2] = byte('0' + year/10%10)
+	buf[3] = byte('0' + year%10)
+	buf[4] = '-'
+	buf[5] = byte('0' + int(month)/10)
+	buf[6] = byte('0' + int(month)%10)
+	buf[7] = '-'
+	buf[8] = byte('0' + day/10)
+	buf[9] = byte('0' + day%10)
+	buf[10] = 'T'
+	buf[11] = byte('0' + hour/10)
+	buf[12] = byte('0' + hour%10)
+	buf[13] = ':'
+	buf[14] = byte('0' + minute/10)
+	buf[15] = byte('0' + minute%10)
+	buf[16] = ':'
+	buf[17] = byte('0' + sec/10)
+	buf[18] = byte('0' + sec%10)
+	buf[19] = '.'
+	buf[20] = byte('0' + ms/100)
+	buf[21] = byte('0' + ms/10%10)
+	buf[22] = byte('0' + ms%10)
+	buf[23] = 'Z'
+	return string(buf[:])
+}
 func nodeID(kind string, id int) string {
+	var raw [48]byte
+	if len(kind)+1+20 <= len(raw) {
+		n := copy(raw[:], kind)
+		raw[n] = ':'
+		b := strconv.AppendInt(raw[:n+1], int64(id), 10)
+		var enc [64]byte
+		base64.RawURLEncoding.Encode(enc[:], b)
+		return string(enc[:base64.RawURLEncoding.EncodedLen(len(b))])
+	}
 	return base64.RawURLEncoding.EncodeToString([]byte(kind + ":" + strconv.Itoa(id)))
 }
 func stringVal(v any) string  { x, _ := v.(string); return x }
@@ -148,7 +190,16 @@ func encoded(v any) []byte {
 	}
 	return b
 }
-func repoKey(name string) string     { return strings.ToLower(name) }
+func asciiLower(s string) string {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || c >= 0x80 {
+			return strings.ToLower(s)
+		}
+	}
+	return s
+}
+func repoKey(name string) string     { return asciiLower(name) }
 func branchRef(branch string) string { return "refs/heads/" + branch }
 
 var legalName = regexp.MustCompile("^[A-Za-z0-9_.-]{1,100}$")
@@ -240,6 +291,17 @@ func issueLabels(r *repository, input any) []*label {
 	}
 	return result
 }
+func (s *store) createIssueValues(r *repository, title, body string, labels []*label) *issue {
+	if !r.hasIssues {
+		reject(410, "Issues are disabled")
+	}
+	id, date := s.allocate(), s.now()
+	i := &issue{ID: id, NodeID: nodeID("Issue", id), Number: r.nextNumber, Title: title, Body: body, State: "open", Labels: labels, User: s.user, Created: date, Updated: date, repo: r}
+	r.nextNumber++
+	r.issues[i.Number] = i
+	s.nodes[i.NodeID] = i
+	return i
+}
 func (s *store) createIssue(r *repository, input mapJSON) *issue {
 	if !r.hasIssues {
 		reject(410, "Issues are disabled")
@@ -249,12 +311,7 @@ func (s *store) createIssue(r *repository, input mapJSON) *issue {
 	if v, ok := input["labels"]; ok {
 		labels = issueLabels(r, v)
 	}
-	id, date := s.allocate(), s.now()
-	i := &issue{ID: id, NodeID: nodeID("Issue", id), Number: r.nextNumber, Title: title, Body: stringVal(input["body"]), State: "open", Labels: labels, User: s.user, Created: date, Updated: date, repo: r}
-	r.nextNumber++
-	r.issues[i.Number] = i
-	s.nodes[i.NodeID] = i
-	return i
+	return s.createIssueValues(r, title, stringVal(input["body"]), labels)
 }
 func (s *store) editIssue(i *issue, input mapJSON) *issue {
 	title, labels := i.Title, i.Labels
