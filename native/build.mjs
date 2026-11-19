@@ -18,6 +18,7 @@ execFileSync(process.env.FORGE_GO ?? 'go', [
   '-gcflags=crypto/subtle=',
   '-gcflags=github.com/klauspost/compress/zlib=-l',
   '-gcflags=mime/...=-l',
+  '-gcflags=github.com/valyala/fasthttp/...=-l',
   '-o', output, '.',
 ], {
   cwd,

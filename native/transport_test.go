@@ -95,4 +95,12 @@ func TestHTTPFramingAndCacheInvalidation(t *testing.T) {
 	testHTTPResponse(t, otherReader, 100)
 	other.Write(body)
 	testHTTPResponse(t, otherReader, 201)
+
+	// Percent-encoded paths and repeated POST upload-pack wire matches work on the same connection.
+	io.WriteString(conn, "GET /api/v3/repos/adaiversen/cache/contents/missing%20file HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\n\r\n")
+	testHTTPResponse(t, reader, 404)
+	io.WriteString(conn, "GET /api/v3/repos/adaiversen/cache/issues/1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\nConnection: close\r\n\r\n")
+	if !strings.Contains(testHTTPResponse(t, reader, 200), `"state":"closed"`) {
+		t.Fatal("missing closed state after fallback")
+	}
 }
